@@ -1,16 +1,50 @@
-// server.js — npm install express cors dotenv express-rate-limit
+// server.js
+// npm install express cors dotenv express-rate-limit @supabase/supabase-js
 require("dotenv").config();
 const express   = require("express");
 const cors      = require("cors");
 const rateLimit = require("express-rate-limit");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL }));
-app.use(express.json({ limit: "20mb" })); // allow image uploads
+app.use(express.json({ limit: "20mb" }));
 
-// Rate limiting — 20 requests per 15 minutes per IP
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
+// Rate limiting — 60 requests per 15 minutes per IP
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 });
 app.use(limiter);
+
+// ─────────────────────────────────────────────
+//  SUPABASE ADMIN CLIENT
+// ─────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY,  // service role key — never expose to frontend
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+
+// ─────────────────────────────────────────────
+//  AUTH MIDDLEWARE
+//  Verifies the Supabase JWT passed in Authorization header.
+//  Attaches req.user = { id, email, ... } on success.
+// ─────────────────────────────────────────────
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ status: "error", message: "Missing or invalid auth token." });
+  }
+  const token = authHeader.split(" ")[1];
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ status: "error", message: "Invalid or expired session. Please sign in again." });
+    }
+    req.user = data.user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ status: "error", message: "Auth error: " + e.message });
+  }
+}
 
 const AYRSHARE_BASE  = "https://app.ayrshare.com/api";
 const ANTHROPIC_BASE = "https://api.anthropic.com/v1/messages";
@@ -20,8 +54,51 @@ const ANTHROPIC_HEADERS = {
   "anthropic-version": "2023-06-01",
 };
 
-// 1️⃣  GET /social/profiles
-app.get("/social/profiles", async (req, res) => {
+// ─────────────────────────────────────────────
+//  5️⃣  GET /user/profile  — load saved profile
+// ─────────────────────────────────────────────
+app.get("/user/profile", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("ayrshare_api_key, business_desc, full_name")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error && error.code !== "PGRST116") { // PGRST116 = no rows found (new user)
+      throw error;
+    }
+    res.json(data || {});
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  6️⃣  PUT /user/profile  — save/update profile
+// ─────────────────────────────────────────────
+app.put("/user/profile", requireAuth, async (req, res) => {
+  const { ayrshare_api_key, business_desc, full_name } = req.body;
+  const updates = { id: req.user.id, updated_at: new Date().toISOString() };
+  if (ayrshare_api_key !== undefined) updates.ayrshare_api_key = ayrshare_api_key;
+  if (business_desc    !== undefined) updates.business_desc    = business_desc;
+  if (full_name        !== undefined) updates.full_name        = full_name;
+
+  try {
+    const { error } = await supabase
+      .from("profiles")
+      .upsert(updates, { onConflict: "id" });
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  1️⃣  GET /social/profiles
+// ─────────────────────────────────────────────
+app.get("/social/profiles", requireAuth, async (req, res) => {
   const apiKey = req.query.key || process.env.AYRSHARE_API_KEY;
   if (!apiKey) return res.status(400).json({ status: "error", message: "No API key provided." });
   try {
@@ -34,13 +111,15 @@ app.get("/social/profiles", async (req, res) => {
   }
 });
 
-// 2️⃣  POST /social/post
-app.post("/social/post", async (req, res) => {
+// ─────────────────────────────────────────────
+//  2️⃣  POST /social/post
+// ─────────────────────────────────────────────
+app.post("/social/post", requireAuth, async (req, res) => {
   const { key, text, platforms, scheduleDate } = req.body;
   const apiKey = key || process.env.AYRSHARE_API_KEY;
-  if (!apiKey)            return res.status(400).json({ status: "error", message: "No API key provided." });
-  if (!text)              return res.status(400).json({ status: "error", message: "No post text provided." });
-  if (!platforms?.length) return res.status(400).json({ status: "error", message: "No platforms selected." });
+  if (!apiKey)             return res.status(400).json({ status: "error", message: "No API key provided." });
+  if (!text)               return res.status(400).json({ status: "error", message: "No post text provided." });
+  if (!platforms?.length)  return res.status(400).json({ status: "error", message: "No platforms selected." });
   const body = { post: text, platforms };
   if (scheduleDate) body.scheduleDate = scheduleDate;
   try {
@@ -55,8 +134,10 @@ app.post("/social/post", async (req, res) => {
   }
 });
 
-// 3️⃣  POST /ai/generate-ads
-app.post("/ai/generate-ads", async (req, res) => {
+// ─────────────────────────────────────────────
+//  3️⃣  POST /ai/generate-ads
+// ─────────────────────────────────────────────
+app.post("/ai/generate-ads", requireAuth, async (req, res) => {
   const { businessDesc, adGoal, platforms, images = [] } = req.body;
   const contentParts = [];
   images.forEach(img => {
@@ -86,8 +167,10 @@ app.post("/ai/generate-ads", async (req, res) => {
   }
 });
 
-// 4️⃣  POST /ai/revise-ad
-app.post("/ai/revise-ad", async (req, res) => {
+// ─────────────────────────────────────────────
+//  4️⃣  POST /ai/revise-ad
+// ─────────────────────────────────────────────
+app.post("/ai/revise-ad", requireAuth, async (req, res) => {
   const { ad, feedback } = req.body;
   try {
     const resp = await fetch(ANTHROPIC_BASE, {
@@ -108,6 +191,11 @@ app.post("/ai/revise-ad", async (req, res) => {
     res.status(500).json({ status: "error", message: e.message });
   }
 });
+
+// ─────────────────────────────────────────────
+//  HEALTH CHECK
+// ─────────────────────────────────────────────
+app.get("/health", (req, res) => res.json({ status: "ok", service: "Mercavex Backend" }));
 
 app.listen(process.env.PORT || 4000, () =>
   console.log(`Mercavex backend running on port ${process.env.PORT || 4000}`)
