@@ -112,16 +112,53 @@ app.get("/social/profiles", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  IMAGE UPLOAD HELPER
+//  Uploads base64 images to Supabase Storage and returns public URLs.
+//  Requires a public bucket named "post-media" in Supabase Storage.
+//  One-time setup SQL (run in Supabase SQL editor):
+//    insert into storage.buckets (id, name, public) values ('post-media', 'post-media', true);
+//    create policy "Public read" on storage.objects for select using (bucket_id = 'post-media');
+//    create policy "Auth upload" on storage.objects for insert with check (bucket_id = 'post-media');
+// ─────────────────────────────────────────────
+async function uploadImagesToStorage(images) {
+  const urls = [];
+  for (const img of images) {
+    const buffer   = Buffer.from(img.data, "base64");
+    const ext      = (img.mediaType || "image/jpeg").split("/")[1] || "jpg";
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const { error } = await supabase.storage
+      .from("post-media")
+      .upload(filename, buffer, { contentType: img.mediaType, upsert: false });
+    if (error) throw new Error(`Storage upload failed: ${error.message}`);
+    const { data: { publicUrl } } = supabase.storage.from("post-media").getPublicUrl(filename);
+    urls.push(publicUrl);
+  }
+  return urls;
+}
+
+// ─────────────────────────────────────────────
 //  2️⃣  POST /social/post
 // ─────────────────────────────────────────────
 app.post("/social/post", requireAuth, async (req, res) => {
-  const { key, text, platforms, scheduleDate } = req.body;
+  const { key, text, platforms, scheduleDate, images = [] } = req.body;
   const apiKey = key || process.env.AYRSHARE_API_KEY;
-  if (!apiKey)             return res.status(400).json({ status: "error", message: "No API key provided." });
-  if (!text)               return res.status(400).json({ status: "error", message: "No post text provided." });
-  if (!platforms?.length)  return res.status(400).json({ status: "error", message: "No platforms selected." });
+  if (!apiKey)            return res.status(400).json({ status: "error", message: "No API key provided." });
+  if (!text)              return res.status(400).json({ status: "error", message: "No post text provided." });
+  if (!platforms?.length) return res.status(400).json({ status: "error", message: "No platforms selected." });
+
   const body = { post: text, platforms };
   if (scheduleDate) body.scheduleDate = scheduleDate;
+
+  // Upload images → get public URLs → pass as mediaUrls to Ayrshare
+  if (images.length > 0) {
+    try {
+      body.mediaUrls = await uploadImagesToStorage(images);
+    } catch (e) {
+      console.error("Image upload error:", e.message);
+      // Don't block the post — publish without images
+    }
+  }
+
   try {
     const resp = await fetch(`${AYRSHARE_BASE}/post`, {
       method: "POST",
