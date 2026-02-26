@@ -2,7 +2,6 @@
 require("dotenv").config();
 const express    = require("express");
 const cors       = require("cors");
-const fetch      = require("node-fetch");
 const rateLimit  = require("express-rate-limit");
 
 const app = express();
