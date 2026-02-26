@@ -230,6 +230,65 @@ app.post("/ai/revise-ad", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  CAMPAIGNS  —  GET / POST / DELETE
+// ─────────────────────────────────────────────
+
+// List all campaigns for the authenticated user (newest first)
+app.get("/campaigns", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("campaigns")
+      .select("id, created_at, business_desc, ad_goal, platforms, schedule_id, post_time, ads, publish_log")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// Save a new campaign record after publishing
+app.post("/campaigns", requireAuth, async (req, res) => {
+  const { business_desc, ad_goal, platforms, schedule_id, post_time, ads, publish_log } = req.body;
+  try {
+    const { data, error } = await supabase
+      .from("campaigns")
+      .insert({
+        user_id:      req.user.id,
+        business_desc,
+        ad_goal,
+        platforms,
+        schedule_id,
+        post_time,
+        ads,
+        publish_log,
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// Delete a campaign (owner-gated via user_id check)
+app.delete("/campaigns/:id", requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("campaigns")
+      .delete()
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id);
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  HEALTH CHECK
 // ─────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok", service: "Mercavex Backend" }));
