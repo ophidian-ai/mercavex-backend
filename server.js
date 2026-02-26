@@ -54,6 +54,11 @@ const ANTHROPIC_HEADERS = {
   "anthropic-version": "2023-06-01",
 };
 
+const FAL_BASE       = "https://fal.run";
+const FAL_QUEUE_BASE = "https://queue.fal.run";
+const FAL_KEY        = process.env.FAL_API_KEY;
+const falHeaders     = { "Authorization": `Key ${FAL_KEY}`, "Content-Type": "application/json" };
+
 // ─────────────────────────────────────────────
 //  5️⃣  GET /user/profile  — load saved profile
 // ─────────────────────────────────────────────
@@ -140,7 +145,7 @@ async function uploadImagesToStorage(images) {
 //  2️⃣  POST /social/post
 // ─────────────────────────────────────────────
 app.post("/social/post", requireAuth, async (req, res) => {
-  const { key, text, platforms, scheduleDate, images = [] } = req.body;
+  const { key, text, platforms, scheduleDate, images = [], mediaUrls: directMediaUrls } = req.body;
   const apiKey = key || process.env.AYRSHARE_API_KEY;
   if (!apiKey)            return res.status(400).json({ status: "error", message: "No API key provided." });
   if (!text)              return res.status(400).json({ status: "error", message: "No post text provided." });
@@ -149,8 +154,10 @@ app.post("/social/post", requireAuth, async (req, res) => {
   const body = { post: text, platforms };
   if (scheduleDate) body.scheduleDate = scheduleDate;
 
-  // Upload images → get public URLs → pass as mediaUrls to Ayrshare
-  if (images.length > 0) {
+  // Use pre-generated media URLs, or upload base64 images to storage
+  if (directMediaUrls?.length > 0) {
+    body.mediaUrls = directMediaUrls;
+  } else if (images.length > 0) {
     try {
       body.mediaUrls = await uploadImagesToStorage(images);
     } catch (e) {
@@ -229,6 +236,228 @@ app.post("/ai/revise-ad", requireAuth, async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────
+//  AI IMAGE GENERATION  —  POST /ai/generate-image
+//  1. Claude writes a rich visual prompt from the ad copy
+//  2. fal.ai Flux generates the image (text-to-image or img2img)
+//  3. Result downloaded → uploaded to Supabase Storage → URL returned
+// ─────────────────────────────────────────────
+app.post("/ai/generate-image", requireAuth, async (req, res) => {
+  const { businessDesc, adHeadline, adBody, platforms, sourceImageBase64, sourceMediaType } = req.body;
+  if (!FAL_KEY) return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured on server." });
+
+  try {
+    // Step 1: Claude crafts the visual prompt
+    const promptResp = await fetch(ANTHROPIC_BASE, {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 300,
+        system: "You are an elite creative director writing prompts for AI image generation. Return ONLY the prompt string — no explanation, no quotes, no preamble.",
+        messages: [{
+          role: "user",
+          content: `Business: ${businessDesc}
+Ad Headline: ${adHeadline}
+Ad Body: ${adBody}
+Platforms: ${platforms || "Instagram, Facebook"}
+
+Write a single detailed image generation prompt for a stunning, professional social media ad creative.
+Requirements:
+- Photorealistic or high-end commercial photography style
+- Evoke the emotional tone of the ad copy
+- Strong composition, cinematic lighting, shallow depth of field
+- Colors that feel premium and intentional
+- NO text, words, logos, or watermarks in the image
+- Optimised for landscape 16:9 social media format
+Return only the prompt.`,
+        }],
+      }),
+    });
+    const promptData   = await promptResp.json();
+    const imagePrompt  = promptData.content?.find(b => b.type === "text")?.text?.trim() || `Premium product advertisement, ${businessDesc}, cinematic lighting, professional photography`;
+
+    // Step 2: Generate image with fal.ai Flux
+    let falBody;
+    let falEndpoint;
+
+    if (sourceImageBase64) {
+      // Image-to-image: transform user's product photo into polished ad creative
+      falEndpoint = `${FAL_BASE}/fal-ai/flux/dev/image-to-image`;
+      falBody = {
+        prompt:           imagePrompt,
+        image_url:        `data:${sourceMediaType || "image/jpeg"};base64,${sourceImageBase64}`,
+        strength:         0.72,
+        num_inference_steps: 28,
+        guidance_scale:   3.5,
+        image_size:       "landscape_16_9",
+        num_images:       1,
+        enable_safety_checker: true,
+      };
+    } else {
+      // Text-to-image: generate from scratch
+      falEndpoint = `${FAL_BASE}/fal-ai/flux/dev`;
+      falBody = {
+        prompt:           imagePrompt,
+        num_inference_steps: 28,
+        guidance_scale:   3.5,
+        image_size:       "landscape_16_9",
+        num_images:       1,
+        enable_safety_checker: true,
+      };
+    }
+
+    const falResp = await fetch(falEndpoint, {
+      method:  "POST",
+      headers: falHeaders,
+      body:    JSON.stringify(falBody),
+    });
+    const falData = await falResp.json();
+
+    if (!falData.images?.[0]?.url) {
+      throw new Error(falData.detail || falData.error || "fal.ai returned no image.");
+    }
+
+    const tempUrl = falData.images[0].url;
+
+    // Step 3: Download image → upload to Supabase Storage for a permanent URL
+    const imgResp  = await fetch(tempUrl);
+    const imgBuf   = Buffer.from(await imgResp.arrayBuffer());
+    const ext      = "jpg";
+    const filename = `ai-img-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from("post-media")
+      .upload(filename, imgBuf, { contentType: "image/jpeg", upsert: false });
+    if (uploadErr) throw new Error(`Storage upload failed: ${uploadErr.message}`);
+
+    const { data: { publicUrl } } = supabase.storage.from("post-media").getPublicUrl(filename);
+
+    res.json({ status: "ok", imageUrl: publicUrl, prompt: imagePrompt });
+  } catch (e) {
+    console.error("Image generation error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  AI VIDEO GENERATION  —  POST /ai/generate-video
+//  Submits an async job to fal.ai Kling v1.6.
+//  Returns requestId immediately — client polls /ai/video-status/:id
+// ─────────────────────────────────────────────
+app.post("/ai/generate-video", requireAuth, async (req, res) => {
+  const { imageUrl, adHeadline, adBody, businessDesc } = req.body;
+  if (!FAL_KEY)   return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured on server." });
+  if (!imageUrl)  return res.status(400).json({ status: "error", message: "imageUrl is required to generate a video." });
+
+  try {
+    // Claude writes a cinematic motion prompt for the video
+    const promptResp = await fetch(ANTHROPIC_BASE, {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 150,
+        system: "You write video motion prompts for AI video generation. Return ONLY the prompt — no explanation, no preamble.",
+        messages: [{
+          role: "user",
+          content: `Business: ${businessDesc}
+Ad Headline: ${adHeadline}
+Ad Body: ${adBody}
+
+Write a short (1-2 sentence) motion prompt describing subtle, cinematic camera movement and ambient motion for a 5-second social media ad video.
+The video starts from a static ad image. Describe ONLY the motion/animation — gentle parallax, slow zoom, particle effects, bokeh shift, etc.
+Make it feel premium and professional. Return only the motion prompt.`,
+        }],
+      }),
+    });
+    const pData       = await promptResp.json();
+    const videoPrompt = pData.content?.find(b => b.type === "text")?.text?.trim()
+      || "Slow cinematic zoom in with gentle bokeh blur in background, subtle light rays, premium feel";
+
+    // Submit async video job to fal.ai Kling v1.6
+    const falResp = await fetch(`${FAL_QUEUE_BASE}/fal-ai/kling-video/v1.6/standard/image-to-video`, {
+      method:  "POST",
+      headers: falHeaders,
+      body:    JSON.stringify({
+        image_url:    imageUrl,
+        prompt:       videoPrompt,
+        duration:     "5",
+        aspect_ratio: "16:9",
+      }),
+    });
+    const falData = await falResp.json();
+
+    if (!falData.request_id) {
+      throw new Error(falData.detail || falData.error || "fal.ai did not return a request_id.");
+    }
+
+    res.json({ status: "ok", requestId: falData.request_id, prompt: videoPrompt });
+  } catch (e) {
+    console.error("Video submit error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  VIDEO STATUS POLL  —  GET /ai/video-status/:requestId
+//  Polls fal.ai queue. On completion downloads the video,
+//  uploads to Supabase Storage, and returns the permanent URL.
+// ─────────────────────────────────────────────
+app.get("/ai/video-status/:requestId", requireAuth, async (req, res) => {
+  const { requestId } = req.params;
+  if (!FAL_KEY) return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured." });
+
+  try {
+    const MODEL = "fal-ai/kling-video/v1.6/standard/image-to-video";
+
+    // Check status first
+    const statusResp = await fetch(`${FAL_QUEUE_BASE}/${MODEL}/requests/${requestId}/status`, {
+      headers: falHeaders,
+    });
+    const statusData = await statusResp.json();
+
+    if (statusData.status === "IN_QUEUE" || statusData.status === "IN_PROGRESS") {
+      return res.json({ status: "processing" });
+    }
+
+    if (statusData.status === "FAILED") {
+      return res.json({ status: "failed", message: "Video generation failed on fal.ai." });
+    }
+
+    if (statusData.status === "COMPLETED") {
+      // Fetch the result
+      const resultResp = await fetch(`${FAL_QUEUE_BASE}/${MODEL}/requests/${requestId}`, {
+        headers: falHeaders,
+      });
+      const resultData = await resultResp.json();
+
+      const tempVideoUrl = resultData.video?.url;
+      if (!tempVideoUrl) throw new Error("No video URL in fal.ai result.");
+
+      // Download and upload to Supabase for a permanent URL
+      const vidResp  = await fetch(tempVideoUrl);
+      const vidBuf   = Buffer.from(await vidResp.arrayBuffer());
+      const filename = `ai-vid-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`;
+
+      const { error: uploadErr } = await supabase.storage
+        .from("post-media")
+        .upload(filename, vidBuf, { contentType: "video/mp4", upsert: false });
+      if (uploadErr) throw new Error(`Storage upload failed: ${uploadErr.message}`);
+
+      const { data: { publicUrl } } = supabase.storage.from("post-media").getPublicUrl(filename);
+      return res.json({ status: "completed", videoUrl: publicUrl });
+    }
+
+    // Unknown status — treat as still processing
+    res.json({ status: "processing" });
+  } catch (e) {
+    console.error("Video status error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 //  CAMPAIGNS  —  GET / POST / DELETE
 // ─────────────────────────────────────────────
@@ -283,6 +512,123 @@ app.delete("/campaigns/:id", requireAuth, async (req, res) => {
       .eq("user_id", req.user.id);
     if (error) throw error;
     res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+
+// ─────────────────────────────────────────────
+//  ANALYTICS  —  GET /analytics
+//  Pulls per-post metrics from Ayrshare for
+//  every post ID stored in the user's campaigns,
+//  then aggregates into platform totals + trend.
+// ─────────────────────────────────────────────
+app.get("/analytics", requireAuth, async (req, res) => {
+  const apiKey = req.query.key;
+  if (!apiKey) return res.status(400).json({ status: "error", message: "No Ayrshare API key provided." });
+
+  try {
+    // 1. Load all campaigns for this user
+    const { data: campaigns, error } = await supabase
+      .from("campaigns")
+      .select("id, created_at, business_desc, publish_log")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+
+    // 2. Collect post refs that have an Ayrshare post ID
+    const postRefs = [];
+    for (const campaign of campaigns || []) {
+      for (const entry of campaign.publish_log || []) {
+        if (entry.ayrshareId) {
+          postRefs.push({
+            campaignId:   campaign.id,
+            businessDesc: campaign.business_desc,
+            ayrshareId:   entry.ayrshareId,
+            adTitle:      entry.adTitle,
+            scheduleDate: entry.scheduleDate,
+            platforms:    entry.platforms || [],
+          });
+        }
+      }
+    }
+
+    if (postRefs.length === 0) {
+      return res.json({ posts: [], platforms: {}, topPost: null, trend: [], totalPosts: 0 });
+    }
+
+    // 3. Fetch Ayrshare analytics for each post in parallel
+    const analyticsResults = await Promise.allSettled(
+      postRefs.map(ref =>
+        fetch(`${AYRSHARE_BASE}/analytics/post`, {
+          method:  "POST",
+          headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body:    JSON.stringify({ id: ref.ayrshareId, platforms: ref.platforms }),
+        }).then(r => r.json())
+      )
+    );
+
+    // 4. Aggregate stats per post and per platform
+    const posts          = [];
+    const platformTotals = {};
+
+    for (let i = 0; i < postRefs.length; i++) {
+      const ref    = postRefs[i];
+      const result = analyticsResults[i];
+      if (result.status !== "fulfilled") continue;
+
+      const analytics = result.value.analytics || {};
+      let totalImpressions = 0, totalEngagements = 0, totalClicks = 0;
+
+      for (const [platform, m] of Object.entries(analytics)) {
+        const imp = m.impressions      || m.reach              || 0;
+        const eng = m.engagements      || m.totalEngagements   || 0;
+        const cli = m.clicks           || m.linkClicks         || 0;
+
+        totalImpressions += imp;
+        totalEngagements += eng;
+        totalClicks      += cli;
+
+        if (!platformTotals[platform]) {
+          platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
+        }
+        platformTotals[platform].impressions += imp;
+        platformTotals[platform].engagements += eng;
+        platformTotals[platform].clicks      += cli;
+        platformTotals[platform].posts       += 1;
+      }
+
+      posts.push({
+        ...ref,
+        impressions:    totalImpressions,
+        engagements:    totalEngagements,
+        clicks:         totalClicks,
+        engagementRate: totalImpressions > 0
+          ? ((totalEngagements / totalImpressions) * 100).toFixed(1)
+          : "0.0",
+      });
+    }
+
+    // 5. Top performer by engagements
+    const topPost = posts.length > 0
+      ? [...posts].sort((a, b) => b.engagements - a.engagements)[0]
+      : null;
+
+    // 6. Weekly engagement trend (grouped by week-start Sunday)
+    const trendMap = {};
+    for (const post of posts) {
+      if (!post.scheduleDate) continue;
+      const d = new Date(post.scheduleDate);
+      d.setDate(d.getDate() - d.getDay());
+      const key = d.toISOString().split("T")[0];
+      if (!trendMap[key]) trendMap[key] = { date: key, impressions: 0, engagements: 0 };
+      trendMap[key].impressions += post.impressions;
+      trendMap[key].engagements += post.engagements;
+    }
+    const trend = Object.values(trendMap).sort((a, b) => a.date.localeCompare(b.date));
+
+    res.json({ posts, platforms: platformTotals, topPost, trend, totalPosts: posts.length });
   } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
   }
