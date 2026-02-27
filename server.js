@@ -21,10 +21,38 @@ const STRIPE_PRICE_IDS = {
 };
 
 const PLAN_LIMITS = {
-  free:   { campaigns: 3,   video: false },
-  pro:    { campaigns: 9999, video: true  },
-  agency: { campaigns: 9999, video: true  },
+  free:   { campaigns: 3,    video: false, image: false, platforms: 2    },
+  pro:    { campaigns: 9999, video: true,  image: true,  platforms: 10   },
+  agency: { campaigns: 9999, video: true,  image: true,  platforms: 10   },
 };
+
+// ─────────────────────────────────────────────
+//  PLAN HELPER — fetch plan + campaign count
+//  Returns { plan, limits, campaignsThisMonth }
+// ─────────────────────────────────────────────
+async function getPlanAndUsage(userId) {
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("plan")
+    .eq("id", userId)
+    .single();
+
+  const plan   = profile?.plan || "free";
+  const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+  // Count campaigns created this calendar month
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+
+  const { count } = await supabase
+    .from("campaigns")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", monthStart.toISOString());
+
+  return { plan, limits, campaignsThisMonth: count || 0 };
+}
 
 // ─────────────────────────────────────────────
 //  Supabase SQL — run once in SQL editor:
@@ -272,6 +300,33 @@ app.post("/social/post", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────
 app.post("/ai/generate-ads", requireAuth, async (req, res) => {
   const { businessDesc, adGoal, platforms, images = [] } = req.body;
+
+  // ── Plan gates ──
+  try {
+    const { plan, limits, campaignsThisMonth } = await getPlanAndUsage(req.user.id);
+
+    // Campaign count gate
+    if (campaignsThisMonth >= limits.campaigns) {
+      return res.status(403).json({
+        status: "error", code: "PLAN_LIMIT",
+        message: `You've used all ${limits.campaigns} campaigns for this month on the Free plan. Upgrade to Pro for unlimited campaigns.`,
+        used: campaignsThisMonth, limit: limits.campaigns,
+      });
+    }
+
+    // Platform count gate
+    const platformList = Array.isArray(platforms) ? platforms : (platforms || "").split(",").map(p => p.trim()).filter(Boolean);
+    if (platformList.length > limits.platforms) {
+      return res.status(403).json({
+        status: "error", code: "PLAN_LIMIT",
+        message: `The Free plan supports up to ${limits.platforms} platforms. Upgrade to Pro for all 10.`,
+        limit: limits.platforms,
+      });
+    }
+  } catch (e) {
+    // Non-fatal — allow through if plan check fails
+    console.error("Plan check error:", e.message);
+  }
   const contentParts = [];
   images.forEach(img => {
     contentParts.push({
@@ -335,6 +390,19 @@ app.post("/ai/revise-ad", requireAuth, async (req, res) => {
 app.post("/ai/generate-image", requireAuth, async (req, res) => {
   const { businessDesc, adHeadline, adBody, platforms, sourceImageBase64, sourceMediaType } = req.body;
   if (!FAL_KEY) return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured on server." });
+
+  // ── Plan gate: image is Pro/Agency only ──
+  try {
+    const { limits } = await getPlanAndUsage(req.user.id);
+    if (!limits.image) {
+      return res.status(403).json({
+        status: "error", code: "PLAN_LIMIT",
+        message: "AI image generation is available on Pro and Agency plans. Upgrade to unlock.",
+      });
+    }
+  } catch (e) {
+    return res.status(403).json({ status: "error", code: "PLAN_LIMIT", message: "Could not verify plan. Please try again." });
+  }
 
   try {
     // Step 1: Claude crafts the visual prompt
@@ -821,10 +889,29 @@ app.get("/billing/status", requireAuth, async (req, res) => {
       .eq("id", req.user.id)
       .single();
     if (error && error.code !== "PGRST116") throw error;
+
+    const plan   = data?.plan || "free";
+    const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+    // Campaign count this month
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const { count: campaignsThisMonth } = await supabase
+      .from("campaigns")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", req.user.id)
+      .gte("created_at", monthStart.toISOString());
+
     res.json({
-      plan:            data?.plan            || "free",
-      planPeriodEnd:   data?.plan_period_end || null,
-      hasCustomer:     !!data?.stripe_customer_id,
+      plan,
+      planPeriodEnd:       data?.plan_period_end || null,
+      hasCustomer:         !!data?.stripe_customer_id,
+      campaignsThisMonth:  campaignsThisMonth || 0,
+      campaignLimit:       limits.campaigns,
+      platformLimit:       limits.platforms,
+      imageEnabled:        limits.image,
+      videoEnabled:        limits.video,
     });
   } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
