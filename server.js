@@ -1,13 +1,102 @@
 // server.js
-// npm install express cors dotenv express-rate-limit @supabase/supabase-js
+// npm install express cors dotenv express-rate-limit @supabase/supabase-js stripe
 require("dotenv").config();
 const express   = require("express");
 const cors      = require("cors");
 const rateLimit = require("express-rate-limit");
 const { createClient } = require("@supabase/supabase-js");
+const Stripe    = require("stripe");
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
+// ─────────────────────────────────────────────
+//  Stripe plan → price ID map
+//  Set these in your Render environment variables.
+// ─────────────────────────────────────────────
+const STRIPE_PRICE_IDS = {
+  pro:    process.env.STRIPE_PRO_PRICE_ID    || null,
+  agency: process.env.STRIPE_AGENCY_PRICE_ID || null,
+};
+
+const PLAN_LIMITS = {
+  free:   { campaigns: 3,   video: false },
+  pro:    { campaigns: 9999, video: true  },
+  agency: { campaigns: 9999, video: true  },
+};
+
+// ─────────────────────────────────────────────
+//  Supabase SQL — run once in SQL editor:
+//
+//  ALTER TABLE profiles
+//    ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT,
+//    ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free',
+//    ADD COLUMN IF NOT EXISTS plan_period_end TIMESTAMPTZ;
+// ─────────────────────────────────────────────
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL }));
+
+// ⚠️  Stripe webhook MUST be registered before express.json() —
+//     it needs the raw request body to verify the signature.
+app.post(
+  "/billing/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig    = req.headers["stripe-signature"];
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!stripe || !secret) {
+      return res.status(400).json({ error: "Stripe not configured." });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    } catch (err) {
+      console.error("Webhook signature error:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    const obj = event.data.object;
+
+    // Helper — update profiles row by stripe_customer_id
+    const updatePlan = async (customerId, plan, periodEnd) => {
+      const { error } = await supabase
+        .from("profiles")
+        .update({
+          plan,
+          plan_period_end: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
+        })
+        .eq("stripe_customer_id", customerId);
+      if (error) console.error("Supabase plan update error:", error.message);
+    };
+
+    switch (event.type) {
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const priceId = obj.items?.data?.[0]?.price?.id;
+        let plan = "free";
+        if (priceId === STRIPE_PRICE_IDS.agency) plan = "agency";
+        else if (priceId === STRIPE_PRICE_IDS.pro) plan = "pro";
+        // Downgrade to free if subscription is cancelled/unpaid
+        if (["canceled", "unpaid", "incomplete_expired"].includes(obj.status)) plan = "free";
+        await updatePlan(obj.customer, plan, obj.current_period_end);
+        break;
+      }
+      case "customer.subscription.deleted": {
+        await updatePlan(obj.customer, "free", null);
+        break;
+      }
+      default:
+        break;
+    }
+
+    res.json({ received: true });
+  }
+);
+
 app.use(express.json({ limit: "20mb" }));
 
 // Rate limiting — 60 requests per 15 minutes per IP
@@ -350,6 +439,26 @@ app.post("/ai/generate-video", requireAuth, async (req, res) => {
   const { imageUrl, adHeadline, adBody, businessDesc } = req.body;
   if (!FAL_KEY)   return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured on server." });
   if (!imageUrl)  return res.status(400).json({ status: "error", message: "imageUrl is required to generate a video." });
+
+  // ── Plan gate: video is Pro/Agency only ──
+  try {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("plan")
+      .eq("id", req.user.id)
+      .single();
+    const plan = profile?.plan || "free";
+    if (!PLAN_LIMITS[plan]?.video) {
+      return res.status(403).json({
+        status: "error",
+        code:   "PLAN_LIMIT",
+        message: "AI video generation is available on Pro and Agency plans. Upgrade to unlock.",
+      });
+    }
+  } catch (e) {
+    // Non-blocking — if profile fetch fails, deny by default
+    return res.status(403).json({ status: "error", code: "PLAN_LIMIT", message: "Could not verify plan. Please try again." });
+  }
 
   try {
     // Claude writes a cinematic motion prompt for the video
@@ -696,6 +805,116 @@ app.post("/ai/chat", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("Chat error:", e.message);
     res.status(500).json({ status: "error", message: "Chat unavailable. Please try again." });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  BILLING — GET /billing/status
+//  Returns the user's current plan, period end,
+//  and Stripe customer ID (if any).
+// ─────────────────────────────────────────────
+app.get("/billing/status", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("plan, plan_period_end, stripe_customer_id")
+      .eq("id", req.user.id)
+      .single();
+    if (error && error.code !== "PGRST116") throw error;
+    res.json({
+      plan:            data?.plan            || "free",
+      planPeriodEnd:   data?.plan_period_end || null,
+      hasCustomer:     !!data?.stripe_customer_id,
+    });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  BILLING — POST /billing/create-checkout
+//  Creates a Stripe Checkout Session and returns
+//  the hosted URL. The frontend redirects there.
+// ─────────────────────────────────────────────
+app.post("/billing/create-checkout", requireAuth, async (req, res) => {
+  if (!stripe) return res.status(500).json({ status: "error", message: "Stripe not configured on server." });
+
+  const { plan } = req.body;
+  const priceId  = STRIPE_PRICE_IDS[plan];
+  if (!priceId)  return res.status(400).json({ status: "error", message: `No Stripe price ID configured for plan: ${plan}` });
+
+  try {
+    // Get or create Stripe customer linked to this user
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("stripe_customer_id, full_name")
+      .eq("id", req.user.id)
+      .single();
+
+    let customerId = profile?.stripe_customer_id;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email:    req.user.email,
+        name:     profile?.full_name || req.user.email,
+        metadata: { supabase_user_id: req.user.id },
+      });
+      customerId = customer.id;
+      // Save customer ID for future sessions / webhook lookups
+      await supabase
+        .from("profiles")
+        .update({ stripe_customer_id: customerId })
+        .eq("id", req.user.id);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer:            customerId,
+      mode:                "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${process.env.FRONTEND_URL}?billing=success&plan=${plan}`,
+      cancel_url:  `${process.env.FRONTEND_URL}?billing=cancel`,
+      subscription_data: {
+        metadata: { supabase_user_id: req.user.id, plan },
+      },
+      allow_promotion_codes: true,
+    });
+
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("Checkout error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  BILLING — POST /billing/create-portal
+//  Creates a Stripe Billing Portal session so
+//  the user can manage/cancel their subscription.
+// ─────────────────────────────────────────────
+app.post("/billing/create-portal", requireAuth, async (req, res) => {
+  if (!stripe) return res.status(500).json({ status: "error", message: "Stripe not configured on server." });
+
+  try {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("stripe_customer_id")
+      .eq("id", req.user.id)
+      .single();
+
+    if (!profile?.stripe_customer_id) {
+      return res.status(400).json({ status: "error", message: "No billing account found. Please subscribe first." });
+    }
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer:   profile.stripe_customer_id,
+      return_url: `${process.env.FRONTEND_URL}?billing=portal-return`,
+    });
+
+    res.json({ url: portalSession.url });
+  } catch (e) {
+    console.error("Portal error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
   }
 });
 
