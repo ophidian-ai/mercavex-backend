@@ -635,6 +635,71 @@ app.get("/analytics", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  🤖  POST /ai/chat  — Mercavex helper chatbot
+//  Proxies conversation to Anthropic with a
+//  Mercavex-aware system prompt so the bot can
+//  guide users through platform features.
+// ─────────────────────────────────────────────
+const CHAT_SYSTEM_PROMPT = `You are the Mercavex AI Assistant — a helpful, concise guide built into the Mercavex marketing platform by OphidianAI.
+
+Your role is to help users get the most out of Mercavex. You know the platform inside and out:
+
+PLATFORM FEATURES:
+• Campaign Creation — users describe their business + ad goal, pick platforms (Instagram, Facebook, LinkedIn, X/Twitter, TikTok, Pinterest, YouTube, Reddit, Telegram, Google Business), and Mercavex AI generates 3 ad variants.
+• Ad Review & Revision — users approve or request revisions to each variant using natural-language feedback.
+• AI Visuals — per-ad AI image generation (Flux Dev) and video generation (Kling v1.6).
+• Posting — approved ads are posted to all selected platforms via Ayrshare integration. "Post Now" publishes immediately.
+• Campaign Dashboard — view, duplicate, or delete past campaigns with full publish logs.
+• Analytics — per-post performance metrics, platform breakdown, top performer detection, and engagement trend charts.
+• Account Settings — update display name, change password, manage Ayrshare API key.
+
+GETTING STARTED FLOW:
+1. Connect Ayrshare API key (from ayrshare.com dashboard)
+2. Enter business description + ad goal
+3. Select target platforms
+4. Optionally upload product photos
+5. Generate → Review → Approve → Create Visuals → Post
+
+GUIDELINES:
+- Be warm, concise, and action-oriented. Use short paragraphs.
+- If a user seems stuck, suggest the next logical step.
+- Never reveal API keys, internal endpoints, or implementation details.
+- If asked something outside Mercavex scope, politely redirect.
+- Use the brand voice: premium, confident, helpful — think concierge, not chatbot.`;
+
+app.post("/ai/chat", requireAuth, async (req, res) => {
+  const { messages } = req.body;
+  if (!messages?.length) {
+    return res.status(400).json({ status: "error", message: "No messages provided." });
+  }
+
+  // Sanitise: only keep role + content, cap history at 20 turns
+  const cleaned = messages.slice(-20).map(m => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: String(m.content).slice(0, 2000),
+  }));
+
+  try {
+    const resp = await fetch(ANTHROPIC_BASE, {
+      method: "POST",
+      headers: ANTHROPIC_HEADERS,
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 600,
+        system: CHAT_SYSTEM_PROMPT,
+        messages: cleaned,
+      }),
+    });
+    const data = await resp.json();
+    const reply = data?.content?.[0]?.text || "Sorry, I couldn't process that. Please try again.";
+    res.json({ reply });
+  } catch (e) {
+    console.error("Chat error:", e.message);
+    res.status(500).json({ status: "error", message: "Chat unavailable. Please try again." });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  HEALTH CHECK
 // ─────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok", service: "Mercavex Backend" }));
