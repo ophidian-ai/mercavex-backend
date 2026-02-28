@@ -16,14 +16,16 @@ const stripe = process.env.STRIPE_SECRET_KEY
 //  Set these in your Render environment variables.
 // ─────────────────────────────────────────────
 const STRIPE_PRICE_IDS = {
-  pro:    process.env.STRIPE_PRO_PRICE_ID    || null,
-  agency: process.env.STRIPE_AGENCY_PRICE_ID || null,
+  pro:      process.env.STRIPE_PRO_PRICE_ID      || null,
+  business: process.env.STRIPE_BUSINESS_PRICE_ID || null,
+  agency:   process.env.STRIPE_AGENCY_PRICE_ID   || null,
 };
 
 const PLAN_LIMITS = {
-  free:   { campaigns: 3,    video: false, image: false, platforms: 2    },
-  pro:    { campaigns: 9999, video: true,  image: true,  platforms: 10   },
-  agency: { campaigns: 9999, video: true,  image: true,  platforms: 10   },
+  free:     { campaigns: 3,    video: false, image: false, platforms: 2,  teamSeats: 0, export: false, whitelabel: false, analytics: "basic" },
+  pro:      { campaigns: 25,   video: true,  image: true,  platforms: 10, teamSeats: 0, export: true,  whitelabel: false, analytics: "full"  },
+  business: { campaigns: 9999, video: true,  image: true,  platforms: 10, teamSeats: 0, export: true,  whitelabel: false, analytics: "full"  },
+  agency:   { campaigns: 9999, video: true,  image: true,  platforms: 10, teamSeats: 4, export: true,  whitelabel: true,  analytics: "full"  },
 };
 
 // ─────────────────────────────────────────────
@@ -106,7 +108,8 @@ app.post(
       case "customer.subscription.updated": {
         const priceId = obj.items?.data?.[0]?.price?.id;
         let plan = "free";
-        if (priceId === STRIPE_PRICE_IDS.agency) plan = "agency";
+        if (priceId === STRIPE_PRICE_IDS.agency)   plan = "agency";
+        else if (priceId === STRIPE_PRICE_IDS.business) plan = "business";
         else if (priceId === STRIPE_PRICE_IDS.pro) plan = "pro";
         // Downgrade to free if subscription is cancelled/unpaid
         if (["canceled", "unpaid", "incomplete_expired"].includes(obj.status)) plan = "free";
@@ -309,7 +312,7 @@ app.post("/ai/generate-ads", requireAuth, async (req, res) => {
     if (campaignsThisMonth >= limits.campaigns) {
       return res.status(403).json({
         status: "error", code: "PLAN_LIMIT",
-        message: `You've used all ${limits.campaigns} campaigns for this month on the Free plan. Upgrade to Pro for unlimited campaigns.`,
+        message: `You've used all ${limits.campaigns} campaigns for this month on the ${plan === "free" ? "Free" : "Pro"} plan. Upgrade to ${plan === "free" ? "Pro" : "Business"} for unlimited campaigns.`,
         used: campaignsThisMonth, limit: limits.campaigns,
       });
     }
@@ -397,7 +400,7 @@ app.post("/ai/generate-image", requireAuth, async (req, res) => {
     if (!limits.image) {
       return res.status(403).json({
         status: "error", code: "PLAN_LIMIT",
-        message: "AI image generation is available on Pro and Agency plans. Upgrade to unlock.",
+        message: "AI image generation is available on Pro, Business, and Agency plans. Upgrade to unlock.",
       });
     }
   } catch (e) {
@@ -520,7 +523,7 @@ app.post("/ai/generate-video", requireAuth, async (req, res) => {
       return res.status(403).json({
         status: "error",
         code:   "PLAN_LIMIT",
-        message: "AI video generation is available on Pro and Agency plans. Upgrade to unlock.",
+        message: "AI video generation is available on Pro, Business, and Agency plans. Upgrade to unlock.",
       });
     }
   } catch (e) {
@@ -650,28 +653,16 @@ app.get("/social/history", requireAuth, async (req, res) => {
     });
     const data = await resp.json();
 
-    console.log("Ayrshare /history raw response type:", typeof data, Array.isArray(data) ? `array[${data.length}]` : `keys: ${Object.keys(data || {}).join(",")}`);
-    if (Array.isArray(data) && data[0]) {
-      console.log("First history item keys:", Object.keys(data[0]).join(","), "status:", data[0].status, "id:", data[0].id || data[0]._id || data[0].postId);
-    }
-
-    // Ayrshare may return: array of posts, { posts: [...] }, { history: [...] }, or an error object
-    let posts = [];
-    if (Array.isArray(data)) {
-      posts = data;
-    } else if (data.posts) {
-      posts = data.posts;
-    } else if (data.history) {
-      posts = data.history;
-    }
+    // Ayrshare returns an array of posts (or { posts: [...] })
+    const posts = Array.isArray(data) ? data : (data.posts || []);
 
     // Build a lookup map: ayrshareId → { status, postIds }
     const statusMap = {};
     for (const post of posts) {
-      const id = post.id || post._id || post.postId;
+      const id = post.id || post._id;
       if (!id) continue;
 
-      // Derive overall status from individual platform postIds or top-level status
+      // Derive overall status from individual platform postIds
       const postIds   = post.postIds || [];
       const succeeded = postIds.filter(p => p.status === "success").length;
       const total     = postIds.length;
@@ -690,11 +681,10 @@ app.get("/social/history", requireAuth, async (req, res) => {
       statusMap[id] = {
         status:    liveStatus,
         postIds:   postIds,
-        createdAt: post.created || post.createdAt || post.createDate,
+        createdAt: post.created || post.createdAt,
       };
     }
 
-    console.log("History statusMap entries:", Object.keys(statusMap).length, "statuses:", Object.values(statusMap).map(v => v.status).join(","));
     res.json({ statusMap, totalPosts: posts.length });
   } catch (e) {
     console.error("History fetch error:", e.message);
@@ -766,9 +756,8 @@ app.delete("/campaigns/:id", requireAuth, async (req, res) => {
 //  ANALYTICS  —  GET /analytics
 //  Pulls per-post metrics from Ayrshare for
 //  every post ID stored in the user's campaigns.
-//  Always populates platform presence from stored
-//  campaign data. Enriches with Ayrshare metrics
-//  when available.
+//  Falls back to history data if per-post
+//  analytics are unavailable.
 // ─────────────────────────────────────────────
 app.get("/analytics", requireAuth, async (req, res) => {
   const apiKey = req.query.key;
@@ -796,7 +785,6 @@ app.get("/analytics", requireAuth, async (req, res) => {
             scheduleDate: entry.scheduleDate,
             platforms:    entry.platforms || [],
             createdAt:    campaign.created_at,
-            storedStatus: entry.status || "unknown",
           });
         }
       }
@@ -817,24 +805,36 @@ app.get("/analytics", requireAuth, async (req, res) => {
       )
     );
 
-    // 4. Also try Ayrshare history to get live statuses
-    let historyMap = {};
-    try {
-      const histResp = await fetch(`${AYRSHARE_BASE}/history`, {
-        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      });
-      const histData = await histResp.json();
-      console.log("Ayrshare history response type:", typeof histData, Array.isArray(histData) ? "array" : "object", "keys:", Object.keys(histData || {}).join(","));
-      const histPosts = Array.isArray(histData) ? histData : (histData.posts || histData.history || []);
-      for (const hp of histPosts) {
-        const hid = hp.id || hp._id || hp.postId;
-        if (hid) historyMap[hid] = hp;
+    // 4. Check if analytics returned actual data
+    let hasAnalyticsData = false;
+    for (const result of analyticsResults) {
+      if (result.status === "fulfilled" && result.value.analytics && Object.keys(result.value.analytics).length > 0) {
+        hasAnalyticsData = true;
+        break;
       }
-    } catch (histErr) {
-      console.error("History fallback error:", histErr.message);
     }
 
-    // 5. Aggregate — ALWAYS populate platforms from stored data
+    // 5. If analytics endpoint returned no data, fallback to history endpoint
+    let historyMap = {};
+    if (!hasAnalyticsData) {
+      try {
+        const histResp = await fetch(`${AYRSHARE_BASE}/history`, {
+          headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        });
+        const histData = await histResp.json();
+        const histPosts = Array.isArray(histData) ? histData : (histData.posts || []);
+        for (const hp of histPosts) {
+          const hid = hp.id || hp._id;
+          if (hid) {
+            historyMap[hid] = hp;
+          }
+        }
+      } catch (histErr) {
+        console.error("History fallback error:", histErr.message);
+      }
+    }
+
+    // 6. Aggregate stats per post and per platform
     const posts          = [];
     const platformTotals = {};
 
@@ -843,19 +843,17 @@ app.get("/analytics", requireAuth, async (req, res) => {
       const result = analyticsResults[i];
 
       let totalImpressions = 0, totalEngagements = 0, totalClicks = 0;
-      let enrichedPlatforms = false;
+      let hasMetrics = false;
 
-      // Try structured analytics from Ayrshare
-      if (result.status === "fulfilled" && result.value) {
-        if (i === 0) console.log("Ayrshare analytics sample response keys:", Object.keys(result.value).join(","));
-        const analytics = result.value.analytics || result.value;
+      // Try structured analytics first
+      if (result.status === "fulfilled") {
+        const analytics = result.value.analytics || {};
         for (const [platform, m] of Object.entries(analytics)) {
-          if (typeof m !== "object" || !m) continue;
-          const imp = m.impressions || m.reach || 0;
-          const eng = m.engagements || m.totalEngagements || m.likes || 0;
-          const cli = m.clicks || m.linkClicks || 0;
+          const imp = m.impressions      || m.reach              || 0;
+          const eng = m.engagements      || m.totalEngagements   || m.likes || 0;
+          const cli = m.clicks           || m.linkClicks         || 0;
 
-          if (imp > 0 || eng > 0 || cli > 0) enrichedPlatforms = true;
+          if (imp > 0 || eng > 0 || cli > 0) hasMetrics = true;
 
           totalImpressions += imp;
           totalEngagements += eng;
@@ -871,8 +869,8 @@ app.get("/analytics", requireAuth, async (req, res) => {
         }
       }
 
-      // Fallback: try history data for engagement counts
-      if (!enrichedPlatforms && historyMap[ref.ayrshareId]) {
+      // Fallback: use history data to at least show post presence per platform
+      if (!hasMetrics && historyMap[ref.ayrshareId]) {
         const hp = historyMap[ref.ayrshareId];
         const hPostIds = hp.postIds || [];
         for (const pid of hPostIds) {
@@ -880,33 +878,13 @@ app.get("/analytics", requireAuth, async (req, res) => {
           if (!platform) continue;
           const eng = pid.likes || pid.comments || 0;
           totalEngagements += eng;
+
           if (!platformTotals[platform]) {
             platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
           }
           platformTotals[platform].posts += 1;
           platformTotals[platform].engagements += eng;
-          enrichedPlatforms = true;
         }
-      }
-
-      // Final fallback: ALWAYS register platforms from stored campaign data
-      // This ensures platform breakdown renders even with 0 metrics
-      if (!enrichedPlatforms) {
-        for (const platform of ref.platforms) {
-          if (!platformTotals[platform]) {
-            platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
-          }
-          platformTotals[platform].posts += 1;
-        }
-      }
-
-      // Determine live status
-      const histEntry = historyMap[ref.ayrshareId];
-      let liveStatus = ref.storedStatus;
-      if (histEntry) {
-        const hStatus = histEntry.status;
-        if (hStatus === "success") liveStatus = "success";
-        else if (hStatus === "error") liveStatus = "error";
       }
 
       posts.push({
@@ -917,16 +895,16 @@ app.get("/analytics", requireAuth, async (req, res) => {
         engagementRate: totalImpressions > 0
           ? ((totalEngagements / totalImpressions) * 100).toFixed(1)
           : "0.0",
-        status: liveStatus,
+        status: historyMap[ref.ayrshareId]?.status || (result.status === "fulfilled" ? "tracked" : "pending"),
       });
     }
 
-    // 6. Top performer by engagements
+    // 7. Top performer by engagements
     const topPost = posts.length > 0
       ? [...posts].sort((a, b) => b.engagements - a.engagements)[0]
       : null;
 
-    // 7. Weekly engagement trend (grouped by week-start Sunday)
+    // 8. Weekly engagement trend (grouped by week-start Sunday)
     const trendMap = {};
     for (const post of posts) {
       const dateStr = post.scheduleDate || post.createdAt;
@@ -1048,6 +1026,11 @@ app.get("/billing/status", requireAuth, async (req, res) => {
       platformLimit:       limits.platforms,
       imageEnabled:        limits.image,
       videoEnabled:        limits.video,
+      teamEnabled:         limits.teamSeats > 0,
+      teamSeats:           limits.teamSeats,
+      exportEnabled:       limits.export,
+      whitelabelEnabled:   limits.whitelabel,
+      analyticsLevel:      limits.analytics,
     });
   } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
