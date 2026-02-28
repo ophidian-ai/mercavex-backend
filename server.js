@@ -636,6 +636,60 @@ app.get("/ai/video-status/:requestId", requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  🔄  GET /social/history  — live post statuses from Ayrshare
+//  Returns a map of { ayrshareId → status } for
+//  quick cross-referencing with stored campaigns.
+// ─────────────────────────────────────────────
+app.get("/social/history", requireAuth, async (req, res) => {
+  const apiKey = req.query.key;
+  if (!apiKey) return res.status(400).json({ status: "error", message: "No Ayrshare API key provided." });
+
+  try {
+    const resp = await fetch(`${AYRSHARE_BASE}/history`, {
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    });
+    const data = await resp.json();
+
+    // Ayrshare returns an array of posts (or { posts: [...] })
+    const posts = Array.isArray(data) ? data : (data.posts || []);
+
+    // Build a lookup map: ayrshareId → { status, postIds }
+    const statusMap = {};
+    for (const post of posts) {
+      const id = post.id || post._id;
+      if (!id) continue;
+
+      // Derive overall status from individual platform postIds
+      const postIds   = post.postIds || [];
+      const succeeded = postIds.filter(p => p.status === "success").length;
+      const total     = postIds.length;
+
+      let liveStatus;
+      if (post.status === "success" || (succeeded > 0 && succeeded === total)) {
+        liveStatus = "success";
+      } else if (succeeded > 0) {
+        liveStatus = "partial";
+      } else if (post.status === "error") {
+        liveStatus = "error";
+      } else {
+        liveStatus = post.status || "unknown";
+      }
+
+      statusMap[id] = {
+        status:    liveStatus,
+        postIds:   postIds,
+        createdAt: post.created || post.createdAt,
+      };
+    }
+
+    res.json({ statusMap, totalPosts: posts.length });
+  } catch (e) {
+    console.error("History fetch error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  CAMPAIGNS  —  GET / POST / DELETE
 // ─────────────────────────────────────────────
 
@@ -698,8 +752,9 @@ app.delete("/campaigns/:id", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────
 //  ANALYTICS  —  GET /analytics
 //  Pulls per-post metrics from Ayrshare for
-//  every post ID stored in the user's campaigns,
-//  then aggregates into platform totals + trend.
+//  every post ID stored in the user's campaigns.
+//  Falls back to history data if per-post
+//  analytics are unavailable.
 // ─────────────────────────────────────────────
 app.get("/analytics", requireAuth, async (req, res) => {
   const apiKey = req.query.key;
@@ -726,6 +781,7 @@ app.get("/analytics", requireAuth, async (req, res) => {
             adTitle:      entry.adTitle,
             scheduleDate: entry.scheduleDate,
             platforms:    entry.platforms || [],
+            createdAt:    campaign.created_at,
           });
         }
       }
@@ -735,7 +791,7 @@ app.get("/analytics", requireAuth, async (req, res) => {
       return res.json({ posts: [], platforms: {}, topPost: null, trend: [], totalPosts: 0 });
     }
 
-    // 3. Fetch Ayrshare analytics for each post in parallel
+    // 3. Try Ayrshare analytics for each post in parallel
     const analyticsResults = await Promise.allSettled(
       postRefs.map(ref =>
         fetch(`${AYRSHARE_BASE}/analytics/post`, {
@@ -746,34 +802,86 @@ app.get("/analytics", requireAuth, async (req, res) => {
       )
     );
 
-    // 4. Aggregate stats per post and per platform
+    // 4. Check if analytics returned actual data
+    let hasAnalyticsData = false;
+    for (const result of analyticsResults) {
+      if (result.status === "fulfilled" && result.value.analytics && Object.keys(result.value.analytics).length > 0) {
+        hasAnalyticsData = true;
+        break;
+      }
+    }
+
+    // 5. If analytics endpoint returned no data, fallback to history endpoint
+    let historyMap = {};
+    if (!hasAnalyticsData) {
+      try {
+        const histResp = await fetch(`${AYRSHARE_BASE}/history`, {
+          headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        });
+        const histData = await histResp.json();
+        const histPosts = Array.isArray(histData) ? histData : (histData.posts || []);
+        for (const hp of histPosts) {
+          const hid = hp.id || hp._id;
+          if (hid) {
+            historyMap[hid] = hp;
+          }
+        }
+      } catch (histErr) {
+        console.error("History fallback error:", histErr.message);
+      }
+    }
+
+    // 6. Aggregate stats per post and per platform
     const posts          = [];
     const platformTotals = {};
 
     for (let i = 0; i < postRefs.length; i++) {
       const ref    = postRefs[i];
       const result = analyticsResults[i];
-      if (result.status !== "fulfilled") continue;
 
-      const analytics = result.value.analytics || {};
       let totalImpressions = 0, totalEngagements = 0, totalClicks = 0;
+      let hasMetrics = false;
 
-      for (const [platform, m] of Object.entries(analytics)) {
-        const imp = m.impressions      || m.reach              || 0;
-        const eng = m.engagements      || m.totalEngagements   || 0;
-        const cli = m.clicks           || m.linkClicks         || 0;
+      // Try structured analytics first
+      if (result.status === "fulfilled") {
+        const analytics = result.value.analytics || {};
+        for (const [platform, m] of Object.entries(analytics)) {
+          const imp = m.impressions      || m.reach              || 0;
+          const eng = m.engagements      || m.totalEngagements   || m.likes || 0;
+          const cli = m.clicks           || m.linkClicks         || 0;
 
-        totalImpressions += imp;
-        totalEngagements += eng;
-        totalClicks      += cli;
+          if (imp > 0 || eng > 0 || cli > 0) hasMetrics = true;
 
-        if (!platformTotals[platform]) {
-          platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
+          totalImpressions += imp;
+          totalEngagements += eng;
+          totalClicks      += cli;
+
+          if (!platformTotals[platform]) {
+            platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
+          }
+          platformTotals[platform].impressions += imp;
+          platformTotals[platform].engagements += eng;
+          platformTotals[platform].clicks      += cli;
+          platformTotals[platform].posts       += 1;
         }
-        platformTotals[platform].impressions += imp;
-        platformTotals[platform].engagements += eng;
-        platformTotals[platform].clicks      += cli;
-        platformTotals[platform].posts       += 1;
+      }
+
+      // Fallback: use history data to at least show post presence per platform
+      if (!hasMetrics && historyMap[ref.ayrshareId]) {
+        const hp = historyMap[ref.ayrshareId];
+        const hPostIds = hp.postIds || [];
+        for (const pid of hPostIds) {
+          const platform = pid.platform;
+          if (!platform) continue;
+          const eng = pid.likes || pid.comments || 0;
+          totalEngagements += eng;
+
+          if (!platformTotals[platform]) {
+            platformTotals[platform] = { impressions: 0, engagements: 0, clicks: 0, posts: 0 };
+          }
+          platformTotals[platform].posts += 1;
+          platformTotals[platform].engagements += eng;
+        }
       }
 
       posts.push({
@@ -784,19 +892,21 @@ app.get("/analytics", requireAuth, async (req, res) => {
         engagementRate: totalImpressions > 0
           ? ((totalEngagements / totalImpressions) * 100).toFixed(1)
           : "0.0",
+        status: historyMap[ref.ayrshareId]?.status || (result.status === "fulfilled" ? "tracked" : "pending"),
       });
     }
 
-    // 5. Top performer by engagements
+    // 7. Top performer by engagements
     const topPost = posts.length > 0
       ? [...posts].sort((a, b) => b.engagements - a.engagements)[0]
       : null;
 
-    // 6. Weekly engagement trend (grouped by week-start Sunday)
+    // 8. Weekly engagement trend (grouped by week-start Sunday)
     const trendMap = {};
     for (const post of posts) {
-      if (!post.scheduleDate) continue;
-      const d = new Date(post.scheduleDate);
+      const dateStr = post.scheduleDate || post.createdAt;
+      if (!dateStr) continue;
+      const d = new Date(dateStr);
       d.setDate(d.getDate() - d.getDay());
       const key = d.toISOString().split("T")[0];
       if (!trendMap[key]) trendMap[key] = { date: key, impressions: 0, engagements: 0 };
@@ -807,6 +917,7 @@ app.get("/analytics", requireAuth, async (req, res) => {
 
     res.json({ posts, platforms: platformTotals, topPost, trend, totalPosts: posts.length });
   } catch (e) {
+    console.error("Analytics error:", e.message);
     res.status(500).json({ status: "error", message: e.message });
   }
 });
