@@ -621,13 +621,8 @@ app.post("/ai/generate-video", requireAuth, async (req, res) => {
 
   // ── Plan gate: video is Pro/Agency only ──
   try {
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("plan")
-      .eq("id", req.user.id)
-      .single();
-    const plan = profile?.plan || "free";
-    if (!PLAN_LIMITS[plan]?.video) {
+    const { limits } = await getPlanAndUsage(req.user.id);
+    if (!limits.video) {
       return res.status(403).json({
         status: "error",
         code:   "PLAN_LIMIT",
@@ -635,7 +630,6 @@ app.post("/ai/generate-video", requireAuth, async (req, res) => {
       });
     }
   } catch (e) {
-    // Non-blocking — if profile fetch fails, deny by default
     return res.status(403).json({ status: "error", code: "PLAN_LIMIT", message: "Could not verify plan. Please try again." });
   }
 
