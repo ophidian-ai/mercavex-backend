@@ -674,6 +674,8 @@ app.get("/social/history", requireAuth, async (req, res) => {
         liveStatus = "partial";
       } else if (post.status === "error") {
         liveStatus = "error";
+      } else if (post.status === "queued") {
+        liveStatus = "scheduled"; // Ayrshare alias for immediate posts in-flight
       } else {
         liveStatus = post.status || "unknown";
       }
@@ -1120,6 +1122,194 @@ app.post("/billing/create-portal", requireAuth, async (req, res) => {
     res.json({ url: portalSession.url });
   } catch (e) {
     console.error("Portal error:", e.message);
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  TEAM MANAGEMENT
+//
+//  Supabase SQL — run once in SQL editor:
+//
+//  CREATE TABLE IF NOT EXISTS team_members (
+//    id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+//    owner_id      UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+//    invitee_email TEXT NOT NULL,
+//    role          TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin','member')),
+//    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted')),
+//    invited_at    TIMESTAMPTZ DEFAULT NOW(),
+//    UNIQUE(owner_id, invitee_email)
+//  );
+//
+//  ALTER TABLE team_members ENABLE ROW LEVEL SECURITY;
+//
+//  -- Owner can do anything with their own team rows
+//  CREATE POLICY "owner_all" ON team_members
+//    FOR ALL USING (owner_id = auth.uid());
+//
+// ─────────────────────────────────────────────
+
+// Middleware — Agency plan only
+const requireAgency = async (req, res, next) => {
+  try {
+    const { data } = await supabase
+      .from("profiles")
+      .select("plan")
+      .eq("id", req.user.id)
+      .single();
+    if (data?.plan !== "agency") {
+      return res.status(403).json({ status: "error", message: "Team management requires an Agency plan." });
+    }
+    next();
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+};
+
+// Helper — normalise a DB row into the shape both UI components expect
+// AccountScreen reads m.member_email; standalone TeamManagement reads m.invitee_email
+const normaliseRow = (row) => ({
+  id:             row.id,
+  owner_id:       row.owner_id,
+  invitee_email:  row.invitee_email,
+  member_email:   row.invitee_email,   // alias for AccountScreen
+  role:           row.role,
+  status:         row.status,
+  invited_at:     row.invited_at,
+});
+
+// ── GET /team  (AccountScreen — expects { members: [] })
+app.get("/team", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("team_members")
+      .select("*")
+      .eq("owner_id", req.user.id)
+      .order("invited_at", { ascending: true });
+    if (error) throw error;
+    res.json({ members: (data || []).map(normaliseRow) });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ── GET /team/members  (standalone TeamManagement — expects raw array)
+app.get("/team/members", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("team_members")
+      .select("*")
+      .eq("owner_id", req.user.id)
+      .order("invited_at", { ascending: true });
+    if (error) throw error;
+    res.json((data || []).map(normaliseRow));
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ── POST /team/invite
+app.post("/team/invite", requireAuth, requireAgency, async (req, res) => {
+  const { email, role = "member" } = req.body;
+
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ status: "error", message: "A valid email address is required." });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanRole  = ["admin", "member"].includes(role) ? role : "member";
+
+  // Block inviting yourself
+  if (cleanEmail === req.user.email?.toLowerCase()) {
+    return res.status(400).json({ status: "error", message: "You cannot invite yourself." });
+  }
+
+  try {
+    // Enforce 4-seat limit
+    const { count } = await supabase
+      .from("team_members")
+      .select("id", { count: "exact", head: true })
+      .eq("owner_id", req.user.id);
+
+    if ((count || 0) >= 4) {
+      return res.status(403).json({ status: "error", message: "Seat limit reached. Agency plans support up to 4 team members." });
+    }
+
+    // Upsert — re-inviting an existing member updates their role without creating a duplicate
+    const { data, error } = await supabase
+      .from("team_members")
+      .upsert(
+        { owner_id: req.user.id, invitee_email: cleanEmail, role: cleanRole, status: "pending" },
+        { onConflict: "owner_id,invitee_email", ignoreDuplicates: false }
+      )
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      status:  "ok",
+      message: `Invite sent to ${cleanEmail}. They'll appear as pending until they sign in.`,
+      member:  normaliseRow(data),
+    });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ── PATCH /team/:id  (update role — owner-gated)
+app.patch("/team/:id", requireAuth, requireAgency, async (req, res) => {
+  const { role } = req.body;
+  if (!["admin", "member"].includes(role)) {
+    return res.status(400).json({ status: "error", message: "Role must be 'admin' or 'member'." });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("team_members")
+      .update({ role })
+      .eq("id",       req.params.id)
+      .eq("owner_id", req.user.id)      // owner-gate: can only update own team
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data)  return res.status(404).json({ status: "error", message: "Member not found." });
+
+    res.json({ status: "ok", member: normaliseRow(data) });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ── DELETE /team/:id  (AccountScreen)
+app.delete("/team/:id", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("team_members")
+      .delete()
+      .eq("id",       req.params.id)
+      .eq("owner_id", req.user.id);    // owner-gate
+
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ── DELETE /team/members/:id  (standalone TeamManagement — alias)
+app.delete("/team/members/:id", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("team_members")
+      .delete()
+      .eq("id",       req.params.id)
+      .eq("owner_id", req.user.id);
+
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
   }
 });
