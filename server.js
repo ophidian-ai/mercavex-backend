@@ -611,7 +611,7 @@ Return only the prompt.`,
 
 // ─────────────────────────────────────────────
 //  AI VIDEO GENERATION  —  POST /ai/generate-video
-//  Submits an async job to fal.ai Kling v1.6.
+//  Submits an async job to fal.ai Kling v2.1 Standard.
 //  Returns requestId immediately — client polls /ai/video-status/:id
 // ─────────────────────────────────────────────
 app.post("/ai/generate-video", requireAuth, async (req, res) => {
@@ -658,8 +658,8 @@ Make it feel premium and professional. Return only the motion prompt.`,
     const videoPrompt = pData.content?.find(b => b.type === "text")?.text?.trim()
       || "Slow cinematic zoom in with gentle bokeh blur in background, subtle light rays, premium feel";
 
-    // Submit async video job to fal.ai Kling v1.6
-    const falResp = await fetch(`${FAL_QUEUE_BASE}/fal-ai/kling-video/v1.6/standard/image-to-video`, {
+    // Submit async video job to fal.ai Kling v2.1 Standard
+    const falResp = await fetch(`${FAL_QUEUE_BASE}/fal-ai/kling-video/v2.1/standard/image-to-video`, {
       method:  "POST",
       headers: falHeaders,
       body:    JSON.stringify({
@@ -667,14 +667,18 @@ Make it feel premium and professional. Return only the motion prompt.`,
         prompt:       videoPrompt,
         duration:     "5",
         aspect_ratio: "16:9",
+        cfg_scale:    0.5,
       }),
     });
     const falData = await falResp.json();
 
     if (!falData.request_id) {
-      throw new Error(falData.detail || falData.error || "fal.ai did not return a request_id.");
+      const errMsg = falData.detail || falData.error || falData.message || JSON.stringify(falData);
+      console.error("[Video] fal.ai submission failed:", errMsg);
+      throw new Error(`fal.ai submission failed: ${errMsg}`);
     }
 
+    console.log(`[Video] Submitted Kling v2.1 job ${falData.request_id} for user ${req.user.id}`);
     res.json({ status: "ok", requestId: falData.request_id, prompt: videoPrompt });
   } catch (e) {
     console.error("Video submit error:", e.message);
@@ -692,7 +696,7 @@ app.get("/ai/video-status/:requestId", requireAuth, async (req, res) => {
   if (!FAL_KEY) return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured." });
 
   try {
-    const MODEL = "fal-ai/kling-video/v1.6/standard/image-to-video";
+    const MODEL = "fal-ai/kling-video/v2.1/standard/image-to-video";
 
     // Check status first
     const statusResp = await fetch(`${FAL_QUEUE_BASE}/${MODEL}/requests/${requestId}/status`, {
@@ -1042,7 +1046,7 @@ Your role is to help users get the most out of Mercavex. You know the platform i
 PLATFORM FEATURES:
 • Campaign Creation — users describe their business + ad goal, pick platforms (Instagram, Facebook, LinkedIn, X/Twitter, TikTok, Pinterest, YouTube, Reddit, Telegram, Google Business), and Mercavex AI generates 3 ad variants.
 • Ad Review & Revision — users approve or request revisions to each variant using natural-language feedback.
-• AI Visuals — per-ad AI image generation (Flux Dev) and video generation (Kling v1.6).
+• AI Visuals — per-ad AI image generation (Flux Dev) and video generation (Kling v2.1 Standard).
 • Posting — approved ads are posted to all selected platforms via Ayrshare integration. "Post Now" publishes immediately.
 • Campaign Dashboard — view, duplicate, or delete past campaigns with full publish logs.
 • Analytics — per-post performance metrics, platform breakdown, top performer detection, and engagement trend charts.
