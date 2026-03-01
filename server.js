@@ -204,7 +204,7 @@ app.get("/user/profile", requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("profiles")
-      .select("ayrshare_api_key, business_desc, full_name")
+      .select("ayrshare_api_key, business_desc, full_name, business_type, business_industry, image_model_preference")
       .eq("id", req.user.id)
       .single();
 
@@ -221,11 +221,14 @@ app.get("/user/profile", requireAuth, async (req, res) => {
 //  6️⃣  PUT /user/profile  — save/update profile
 // ─────────────────────────────────────────────
 app.put("/user/profile", requireAuth, async (req, res) => {
-  const { ayrshare_api_key, business_desc, full_name } = req.body;
+  const { ayrshare_api_key, business_desc, full_name, business_type, business_industry, image_model_preference } = req.body;
   const updates = { id: req.user.id, updated_at: new Date().toISOString() };
-  if (ayrshare_api_key !== undefined) updates.ayrshare_api_key = ayrshare_api_key;
-  if (business_desc    !== undefined) updates.business_desc    = business_desc;
-  if (full_name        !== undefined) updates.full_name        = full_name;
+  if (ayrshare_api_key         !== undefined) updates.ayrshare_api_key        = ayrshare_api_key;
+  if (business_desc            !== undefined) updates.business_desc           = business_desc;
+  if (full_name                !== undefined) updates.full_name               = full_name;
+  if (business_type            !== undefined) updates.business_type           = business_type;
+  if (business_industry        !== undefined) updates.business_industry       = business_industry;
+  if (image_model_preference   !== undefined) updates.image_model_preference  = image_model_preference;
 
   try {
     const { error } = await supabase
@@ -404,15 +407,63 @@ app.post("/ai/revise-ad", requireAuth, async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  AI IMAGE GENERATION  —  POST /ai/generate-image
-//  1. Claude writes a rich visual prompt from the ad copy
-//  2. fal.ai Flux generates the image (text-to-image or img2img)
-//  3. Result downloaded → uploaded to Supabase Storage → URL returned
+//
+//  Model routing (based on user's saved business_type):
+//    ecommerce  → FLUX.2 Pro (scene) + Photoroom post-processing
+//    services   → FLUX.2 Pro
+//    lifestyle  → FLUX.2 Pro
+//    creator    → FLUX.2 Pro
+//    agency     → FLUX.2 Pro
+//    default    → FLUX.2 Pro
+//    img2img    → FLUX Dev img-to-img (FLUX.2 img2img not yet available on fal.ai)
+//
+//  Photoroom (PHOTOROOM_API_KEY env var):
+//    Applied as a post-processing step for ecommerce business types.
+//    Removes background, applies AI studio environment. Optional — if key
+//    is missing or call fails, returns the raw FLUX.2 output unchanged.
+//
+//  Supabase SQL — run once:
+//    ALTER TABLE profiles
+//      ADD COLUMN IF NOT EXISTS business_type TEXT DEFAULT 'general',
+//      ADD COLUMN IF NOT EXISTS business_industry TEXT DEFAULT '',
+//      ADD COLUMN IF NOT EXISTS image_model_preference TEXT DEFAULT 'auto';
 // ─────────────────────────────────────────────
+
+// ── Photoroom helper — product photo enhancement ──────────────────────
+async function enhanceWithPhotoroom(imageBuffer, businessDesc) {
+  const PHOTOROOM_KEY = process.env.PHOTOROOM_API_KEY;
+  if (!PHOTOROOM_KEY) return null;
+  try {
+    const form = new FormData();
+    const blob = new Blob([imageBuffer], { type: "image/jpeg" });
+    form.append("imageFile", blob, "image.jpg");
+    // Place product on a clean AI-generated studio background
+    form.append("background.prompt", `Professional product photography studio, clean white seamless background, soft diffused lighting, premium commercial photography, ${businessDesc}`);
+    form.append("padding", "0.1");
+    form.append("outputSize", "landscape_16_9");
+
+    const resp = await fetch("https://image-api.photoroom.com/v2/edit", {
+      method: "POST",
+      headers: { "x-api-key": PHOTOROOM_KEY },
+      body: form,
+    });
+    if (!resp.ok) {
+      console.warn(`Photoroom API returned ${resp.status} — falling back to raw image.`);
+      return null;
+    }
+    return Buffer.from(await resp.arrayBuffer());
+  } catch (e) {
+    console.warn("Photoroom enhancement failed (non-fatal):", e.message);
+    return null;
+  }
+}
+
 app.post("/ai/generate-image", requireAuth, async (req, res) => {
   const { businessDesc, adHeadline, adBody, platforms, sourceImageBase64, sourceMediaType } = req.body;
   if (!FAL_KEY) return res.status(500).json({ status: "error", message: "FAL_API_KEY not configured on server." });
 
   // ── Plan gate: image is Pro/Agency only ──
+  let userBusinessType = "general";
   try {
     const { limits } = await getPlanAndUsage(req.user.id);
     if (!limits.image) {
@@ -425,8 +476,25 @@ app.post("/ai/generate-image", requireAuth, async (req, res) => {
     return res.status(403).json({ status: "error", code: "PLAN_LIMIT", message: "Could not verify plan. Please try again." });
   }
 
+  // ── Fetch user business profile for model routing ──
   try {
-    // Step 1: Claude crafts the visual prompt
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("business_type, image_model_preference")
+      .eq("id", req.user.id)
+      .single();
+    if (profile?.business_type) userBusinessType = profile.business_type;
+  } catch (_) { /* non-fatal — fall back to default routing */ }
+
+  const isEcommerce = userBusinessType === "ecommerce";
+  const usePhotoroom = isEcommerce && !!process.env.PHOTOROOM_API_KEY;
+
+  try {
+    // ── Step 1: Claude writes a tailored visual prompt ──────────────────
+    const promptStyle = isEcommerce
+      ? "product photography style, clean studio environment, hero product shot, commercial e-commerce photography"
+      : "cinematic photography, editorial lifestyle, shallow depth of field, professional ad creative";
+
     const promptResp = await fetch(ANTHROPIC_BASE, {
       method: "POST",
       headers: ANTHROPIC_HEADERS,
@@ -440,12 +508,12 @@ app.post("/ai/generate-image", requireAuth, async (req, res) => {
 Ad Headline: ${adHeadline}
 Ad Body: ${adBody}
 Platforms: ${platforms || "Instagram, Facebook"}
+Visual Style: ${promptStyle}
 
 Write a single detailed image generation prompt for a stunning, professional social media ad creative.
 Requirements:
-- Photorealistic or high-end commercial photography style
+- ${isEcommerce ? "Clean product-forward composition, hero product centered, premium product photography, isolated subject on clean background" : "Photorealistic or high-end commercial photography, strong composition, cinematic lighting, shallow depth of field"}
 - Evoke the emotional tone of the ad copy
-- Strong composition, cinematic lighting, shallow depth of field
 - Colors that feel premium and intentional
 - NO text, words, logos, or watermarks in the image
 - Optimised for landscape 16:9 social media format
@@ -453,35 +521,39 @@ Return only the prompt.`,
         }],
       }),
     });
-    const promptData   = await promptResp.json();
-    const imagePrompt  = promptData.content?.find(b => b.type === "text")?.text?.trim() || `Premium product advertisement, ${businessDesc}, cinematic lighting, professional photography`;
+    const promptData  = await promptResp.json();
+    const imagePrompt = promptData.content?.find(b => b.type === "text")?.text?.trim()
+      || `Premium ${isEcommerce ? "product" : "lifestyle"} advertisement, ${businessDesc}, cinematic lighting, professional photography`;
 
-    // Step 2: Generate image with fal.ai Flux
+    // ── Step 2: Generate image ──────────────────────────────────────────
+    // img2img: keep FLUX Dev (FLUX.2 img2img not yet available on fal.ai)
+    // txt2img: FLUX.2 Pro — 32B params, 4MP, superior realism
     let falBody;
     let falEndpoint;
+    let generatedModel;
 
     if (sourceImageBase64) {
-      // Image-to-image: transform user's product photo into polished ad creative
-      falEndpoint = `${FAL_BASE}/fal-ai/flux/dev/image-to-image`;
+      // Image-to-image: FLUX Dev img2img (proven endpoint)
+      falEndpoint   = `${FAL_BASE}/fal-ai/flux/dev/image-to-image`;
+      generatedModel = "flux-dev-img2img";
       falBody = {
-        prompt:           imagePrompt,
-        image_url:        `data:${sourceMediaType || "image/jpeg"};base64,${sourceImageBase64}`,
-        strength:         0.72,
+        prompt:              imagePrompt,
+        image_url:           `data:${sourceMediaType || "image/jpeg"};base64,${sourceImageBase64}`,
+        strength:            0.72,
         num_inference_steps: 28,
-        guidance_scale:   3.5,
-        image_size:       "landscape_16_9",
-        num_images:       1,
+        guidance_scale:      3.5,
+        image_size:          "landscape_16_9",
+        num_images:          1,
         enable_safety_checker: true,
       };
     } else {
-      // Text-to-image: generate from scratch
-      falEndpoint = `${FAL_BASE}/fal-ai/flux/dev`;
+      // Text-to-image: FLUX.2 Pro — zero-config, production-grade
+      falEndpoint   = `${FAL_BASE}/fal-ai/flux-2-pro`;
+      generatedModel = "flux-2-pro";
       falBody = {
-        prompt:           imagePrompt,
-        num_inference_steps: 28,
-        guidance_scale:   3.5,
-        image_size:       "landscape_16_9",
-        num_images:       1,
+        prompt:     imagePrompt,
+        image_size: "landscape_16_9",
+        num_images: 1,
         enable_safety_checker: true,
       };
     }
@@ -497,14 +569,23 @@ Return only the prompt.`,
       throw new Error(falData.detail || falData.error || "fal.ai returned no image.");
     }
 
-    const tempUrl = falData.images[0].url;
+    // ── Step 3: Download generated image ───────────────────────────────
+    const imgResp = await fetch(falData.images[0].url);
+    let imgBuf    = Buffer.from(await imgResp.arrayBuffer());
 
-    // Step 3: Download image → upload to Supabase Storage for a permanent URL
-    const imgResp  = await fetch(tempUrl);
-    const imgBuf   = Buffer.from(await imgResp.arrayBuffer());
-    const ext      = "jpg";
-    const filename = `ai-img-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    // ── Step 4 (ecommerce only): Photoroom post-processing ─────────────
+    let photoroomApplied = false;
+    if (usePhotoroom && !sourceImageBase64) {
+      const enhanced = await enhanceWithPhotoroom(imgBuf, businessDesc);
+      if (enhanced) {
+        imgBuf = enhanced;
+        photoroomApplied = true;
+        console.log(`[Image] Photoroom applied for ecommerce user ${req.user.id}`);
+      }
+    }
 
+    // ── Step 5: Upload to Supabase Storage for permanent URL ────────────
+    const filename = `ai-img-${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
     const { error: uploadErr } = await supabase.storage
       .from("post-media")
       .upload(filename, imgBuf, { contentType: "image/jpeg", upsert: false });
@@ -512,7 +593,16 @@ Return only the prompt.`,
 
     const { data: { publicUrl } } = supabase.storage.from("post-media").getPublicUrl(filename);
 
-    res.json({ status: "ok", imageUrl: publicUrl, prompt: imagePrompt });
+    console.log(`[Image] Generated via ${generatedModel}${photoroomApplied ? " + Photoroom" : ""} for business_type="${userBusinessType}"`);
+
+    res.json({
+      status:          "ok",
+      imageUrl:        publicUrl,
+      prompt:          imagePrompt,
+      model:           generatedModel,
+      photoroomApplied,
+      businessType:    userBusinessType,
+    });
   } catch (e) {
     console.error("Image generation error:", e.message);
     res.status(500).json({ status: "error", message: e.message });
