@@ -1188,6 +1188,8 @@ app.post("/billing/create-portal", requireAuth, async (req, res) => {
 
 // Middleware — Agency plan only
 const requireAgency = async (req, res, next) => {
+  // Dev accounts always pass — no DB hit needed
+  if (isDevUser(req.user.id)) return next();
   try {
     const { data } = await supabase
       .from("profiles")
@@ -1346,6 +1348,222 @@ app.delete("/team/members/:id", requireAuth, requireAgency, async (req, res) => 
 
     if (error) throw error;
     res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  AGENCY — BRAND WORKSPACE
+//  Stored as JSONB column `agency_workspace` on
+//  the profiles table. No extra table needed.
+//
+//  ALTER TABLE profiles
+//    ADD COLUMN IF NOT EXISTS agency_workspace JSONB DEFAULT '{}';
+// ─────────────────────────────────────────────
+
+// GET /agency/workspace
+app.get("/agency/workspace", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("agency_workspace")
+      .eq("id", req.user.id)
+      .single();
+    if (error) throw error;
+    res.json({ workspace: data?.agency_workspace || {} });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// PUT /agency/workspace
+app.put("/agency/workspace", requireAuth, requireAgency, async (req, res) => {
+  const allowed = ["brand_name","tagline","brand_voice","audience","key_messages","hashtag_sets","notes"];
+  const workspace = {};
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) workspace[key] = req.body[key];
+  }
+  try {
+    const { error } = await supabase
+      .from("profiles")
+      .update({ agency_workspace: workspace })
+      .eq("id", req.user.id);
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  AGENCY — BRIEF LIBRARY
+//  Reusable campaign brief templates per owner.
+//
+//  CREATE TABLE IF NOT EXISTS agency_briefs (
+//    id           UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+//    owner_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+//    title        TEXT NOT NULL,
+//    description  TEXT DEFAULT '',
+//    objective    TEXT DEFAULT '',
+//    platforms    TEXT[] DEFAULT '{}',
+//    tone         TEXT DEFAULT 'professional',
+//    tags         TEXT[] DEFAULT '{}',
+//    created_at   TIMESTAMPTZ DEFAULT NOW()
+//  );
+//  ALTER TABLE agency_briefs ENABLE ROW LEVEL SECURITY;
+//  CREATE POLICY "owner_all" ON agency_briefs FOR ALL USING (owner_id = auth.uid());
+// ─────────────────────────────────────────────
+
+// GET /agency/briefs
+app.get("/agency/briefs", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("agency_briefs")
+      .select("*")
+      .eq("owner_id", req.user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// POST /agency/briefs
+app.post("/agency/briefs", requireAuth, requireAgency, async (req, res) => {
+  const { title, description, objective, platforms, tone, tags } = req.body;
+  if (!title?.trim()) return res.status(400).json({ status: "error", message: "Brief title is required." });
+  try {
+    const { data, error } = await supabase
+      .from("agency_briefs")
+      .insert({
+        owner_id:    req.user.id,
+        title:       title.trim(),
+        description: description || "",
+        objective:   objective   || "",
+        platforms:   platforms   || [],
+        tone:        tone        || "professional",
+        tags:        tags        || [],
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ status: "ok", brief: data });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// DELETE /agency/briefs/:id
+app.delete("/agency/briefs/:id", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("agency_briefs")
+      .delete()
+      .eq("id",       req.params.id)
+      .eq("owner_id", req.user.id);
+    if (error) throw error;
+    res.json({ status: "ok" });
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  AGENCY — ACTIVITY FEED
+//  Auto-logged by backend on key actions.
+//  Also accepts POST from frontend for client events.
+//
+//  CREATE TABLE IF NOT EXISTS agency_activity (
+//    id         UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+//    owner_id   UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+//    actor      TEXT NOT NULL,
+//    action     TEXT NOT NULL,
+//    detail     TEXT DEFAULT '',
+//    icon       TEXT DEFAULT '◉',
+//    created_at TIMESTAMPTZ DEFAULT NOW()
+//  );
+//  ALTER TABLE agency_activity ENABLE ROW LEVEL SECURITY;
+//  CREATE POLICY "owner_all" ON agency_activity FOR ALL USING (owner_id = auth.uid());
+// ─────────────────────────────────────────────
+
+// Helper — log an activity event (called internally)
+async function logActivity(ownerId, actor, action, detail = "", icon = "◉") {
+  try {
+    await supabase.from("agency_activity").insert({ owner_id: ownerId, actor, action, detail, icon });
+  } catch (_) {} // never throw — activity logging is non-critical
+}
+
+// GET /agency/activity
+app.get("/agency/activity", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("agency_activity")
+      .select("*")
+      .eq("owner_id", req.user.id)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// POST /agency/activity  (manual log from frontend, e.g. campaign published)
+app.post("/agency/activity", requireAuth, requireAgency, async (req, res) => {
+  const { actor, action, detail, icon } = req.body;
+  if (!actor || !action) return res.status(400).json({ status: "error", message: "actor and action are required." });
+  await logActivity(req.user.id, actor, action, detail || "", icon || "◉");
+  res.json({ status: "ok" });
+});
+
+// ─────────────────────────────────────────────
+//  AGENCY — CAMPAIGN APPROVAL
+//  Campaigns have an approval_status field.
+//  Members submit for approval; admins approve/reject.
+//
+//  ALTER TABLE campaigns
+//    ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'draft'
+//      CHECK (approval_status IN ('draft','pending','approved','rejected'));
+//  ALTER TABLE campaigns
+//    ADD COLUMN IF NOT EXISTS approval_note TEXT DEFAULT '';
+// ─────────────────────────────────────────────
+
+// GET /agency/approvals — pending campaigns for this owner
+app.get("/agency/approvals", requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("campaigns")
+      .select("*")
+      .eq("user_id", req.user.id)
+      .eq("approval_status", "pending")
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ status: "error", message: e.message });
+  }
+});
+
+// PATCH /agency/approvals/:id — approve or reject
+app.patch("/agency/approvals/:id", requireAuth, requireAgency, async (req, res) => {
+  const { status, note } = req.body; // status: 'approved' | 'rejected'
+  if (!["approved", "rejected"].includes(status)) {
+    return res.status(400).json({ status: "error", message: "status must be 'approved' or 'rejected'." });
+  }
+  try {
+    const { data, error } = await supabase
+      .from("campaigns")
+      .update({ approval_status: status, approval_note: note || "" })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    await logActivity(req.user.id, "Admin", `Campaign ${status}`, data?.name || req.params.id, status === "approved" ? "✅" : "❌");
+    res.json({ status: "ok", campaign: data });
   } catch (e) {
     res.status(500).json({ status: "error", message: e.message });
   }
