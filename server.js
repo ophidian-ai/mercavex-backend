@@ -26,13 +26,31 @@ const PLAN_LIMITS = {
   pro:      { campaigns: 25,   video: true,  image: true,  platforms: 10, teamSeats: 0, export: true,  whitelabel: false, analytics: "full"  },
   business: { campaigns: 9999, video: true,  image: true,  platforms: 10, teamSeats: 0, export: true,  whitelabel: false, analytics: "full"  },
   agency:   { campaigns: 9999, video: true,  image: true,  platforms: 10, teamSeats: 4, export: true,  whitelabel: true,  analytics: "full"  },
+  dev:      { campaigns: 9999, video: true,  image: true,  platforms: 10, teamSeats: 4, export: true,  whitelabel: true,  analytics: "full"  },
 };
+
+// ─────────────────────────────────────────────
+//  DEV ACCOUNTS — set DEV_USER_IDS in Render
+//  environment as a comma-separated list of
+//  Supabase user UUIDs. Dev accounts always
+//  receive agency-level limits and bypass all
+//  plan gates. Never exposed to the client.
+// ─────────────────────────────────────────────
+const DEV_USER_IDS = new Set(
+  (process.env.DEV_USER_IDS || "").split(",").map(s => s.trim()).filter(Boolean)
+);
+const isDevUser = (userId) => DEV_USER_IDS.has(userId);
 
 // ─────────────────────────────────────────────
 //  PLAN HELPER — fetch plan + campaign count
 //  Returns { plan, limits, campaignsThisMonth }
 // ─────────────────────────────────────────────
 async function getPlanAndUsage(userId) {
+  // Dev accounts bypass Stripe entirely
+  if (isDevUser(userId)) {
+    return { plan: "dev", limits: PLAN_LIMITS.dev, campaignsThisMonth: 0 };
+  }
+
   const { data: profile } = await supabase
     .from("profiles")
     .select("plan")
@@ -999,6 +1017,25 @@ app.post("/ai/chat", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────
 app.get("/billing/status", requireAuth, async (req, res) => {
   try {
+    // Dev accounts return full agency-level capabilities, no Stripe lookup needed
+    if (isDevUser(req.user.id)) {
+      return res.json({
+        plan:               "agency",
+        planPeriodEnd:      null,
+        hasCustomer:        false,
+        campaignsThisMonth: 0,
+        campaignLimit:      9999,
+        platformLimit:      10,
+        imageEnabled:       true,
+        videoEnabled:       true,
+        teamEnabled:        true,
+        teamSeats:          4,
+        exportEnabled:      true,
+        whitelabelEnabled:  true,
+        analyticsLevel:     "full",
+      });
+    }
+
     const { data, error } = await supabase
       .from("profiles")
       .select("plan, plan_period_end, stripe_customer_id")
